@@ -11,6 +11,7 @@ import select
 import struct
 import signal
 import math
+import subprocess  # [FIX] Added for hciconfig commands
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QGridLayout, QStackedLayout, QSizePolicy)
@@ -221,6 +222,22 @@ class BluetoothHIDService(threading.Thread):
         self.server_c = None
         self.server_i = None
 
+    def force_adapter_config(self):
+        """Force configuration of HCI adapter using system calls"""
+        print("Forcing HCI Adapter Configuration...", flush=True)
+        # Reset and set class to Keyboard/Mouse (0x0025C0)
+        cmds = [
+            ["sudo", "hciconfig", "hci0", "up"],
+            ["sudo", "hciconfig", "hci0", "class", "0x0025C0"],
+            ["sudo", "hciconfig", "hci0", "sspmode", "1"],
+            ["sudo", "hciconfig", "hci0", "piscan"]
+        ]
+        for cmd in cmds:
+            try:
+                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"HCI Config Error ({cmd}): {e}", flush=True)
+
     def setup_sockets(self):
         try:
             self.server_c = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
@@ -235,7 +252,7 @@ class BluetoothHIDService(threading.Thread):
             except Exception as e:
                 print(f"Warning: Failed to set socket security: {e}", flush=True)
 
-            print("Binding to L2CAP ports 17 and 19...", flush=True)
+            print("Binding to L2CAP ports 17 (Control) and 19 (Interrupt)...", flush=True)
             self.server_c.bind((socket.BDADDR_ANY, 17))
             self.server_i.bind((socket.BDADDR_ANY, 19))
             
@@ -248,6 +265,10 @@ class BluetoothHIDService(threading.Thread):
 
     def run(self):
         print("Starting Bluetooth Service...", flush=True)
+        
+        # [FIX] Force adapter config via shell commands to ensure Class of Device is correct
+        self.force_adapter_config()
+
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self.bus = dbus.SystemBus()
 
@@ -261,6 +282,7 @@ class BluetoothHIDService(threading.Thread):
         try:
             adapter_path = "/org/bluez/hci0"
             adapter = dbus.Interface(self.bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
+            print("Configuring Adapter (Discoverable/Pairable)...", flush=True)
             adapter.Set(BLUEZ_ADAPTER_IFACE, "Powered", dbus.Boolean(True))
             adapter.Set(BLUEZ_ADAPTER_IFACE, "Discoverable", dbus.Boolean(True))
             adapter.Set(BLUEZ_ADAPTER_IFACE, "Pairable", dbus.Boolean(True))
@@ -375,7 +397,6 @@ class BluetoothHIDService(threading.Thread):
         self.i_socket = None
 
     def force_disconnect_device(self):
-        """Explicitly disconnect device from OS level via DBus"""
         self.close_connection()
         if self.connected_device_path:
             print(f"Force disconnecting device: {self.connected_device_path}", flush=True)
@@ -421,7 +442,6 @@ class VirtualKeyboard(QWidget):
         self.layout.setContentsMargins(5, 5, 5, 5)
         self.setLayout(self.layout)
         
-        # Enable Mouse/Touch
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.setMouseTracking(True)
         
@@ -441,8 +461,8 @@ class VirtualKeyboard(QWidget):
         keys = [['ESC', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'BACK'],
                 ['TAB', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '\\'],
                 ['A-LOCK', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', 'ENTER'],
-                ['SHIFT', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 'UP'],
-                ['CTRL', 'WIN', 'ALT', 'SPACE', 'LEFT', 'DOWN', 'RIGHT']]
+                ['SHIFT', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 'SHIFT'],
+                ['CTRL', 'WIN', 'ALT', 'SPACE', 'LEFT', 'UP', 'DOWN', 'RIGHT', 'STATUS']]
         
         self.shift_pressed = False
         self.ctrl_pressed = False
@@ -475,24 +495,23 @@ class VirtualKeyboard(QWidget):
             self.layout.setRowStretch(r, 1) 
             col = 0
             for key_char in key_row:
-                btn = QPushButton(key_char)
-                btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-                btn.setStyleSheet(self.btn_style_normal)
-                # Important: Allow events to pass to parent
-                btn.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
-                
                 span = 1
-                if key_char == 'SPACE': span = 4
+                if key_char == 'SPACE': span = 4 
+                elif key_char == 'STATUS': span = 1 
+
+                if key_char == 'STATUS':
+                    self.layout.addWidget(self.status_label, r, col, 1, span)
+                else:
+                    btn = QPushButton(key_char)
+                    btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+                    btn.setStyleSheet(self.btn_style_normal)
+                    btn.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
+                    self.layout.addWidget(btn, r, col, 1, span)
+                    self.buttons[btn] = key_char
                 
-                self.layout.addWidget(btn, r, col, 1, span)
                 col += span
-                
-                self.buttons[btn] = key_char
 
-        self.layout.addWidget(self.status_label, 4, 10, 1, 2)
-
-    # [FIX] Helper to find button at position (geometry check)
     def get_button_at(self, pos):
         for btn in self.buttons.keys():
             if btn.geometry().contains(pos):
@@ -503,11 +522,10 @@ class VirtualKeyboard(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             local_pos = event.position().toPoint()
             
-            # Check Status Label
             if self.status_label.geometry().contains(local_pos):
                 if self.bt.connected or self.bt.os_connected:
                     self.bt.force_disconnect_device()
-                return
+                return 
 
             self.touch_start_pos = event.position()
             self.touch_last_pos = event.position()
@@ -515,7 +533,6 @@ class VirtualKeyboard(QWidget):
             self.is_scrolling = False
             self.active_button = None
             
-            # [FIX] Find button using geometry check
             btn = self.get_button_at(local_pos)
             if btn:
                 self.active_button = btn
@@ -620,9 +637,10 @@ class VirtualKeyboard(QWidget):
             self.is_dragging = False
             self.active_button = None
 
+    # [FIX] Simplified status text to prevent layout shift
     def update_status(self, connected, os_connected):
         if connected:
-            self.status_label.setText("Active\n(Tap to Disconnect)")
+            self.status_label.setText("Active")
             self.status_label.setStyleSheet("background-color: #004d00; color: #ccffcc; border-radius: 5px; font-size: 14px; font-weight: bold; border: 1px solid #006600;")
         elif os_connected:
             self.status_label.setText("Paired")
@@ -674,6 +692,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         
+        # Only Keyboard (Touchpad integrated)
         self.keyboard = VirtualKeyboard(self.bt_service)
         main_layout.addWidget(self.keyboard)
         
@@ -692,7 +711,6 @@ class MainWindow(QMainWindow):
 # Ctrl+C Handler
 def signal_handler(sig, frame):
     print("Ctrl+C caught. Exiting...", flush=True)
-    # Trigger application exit, forcing closeEvent
     QApplication.closeAllWindows()
 
 if __name__ == '__main__':
